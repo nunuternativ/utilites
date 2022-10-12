@@ -283,16 +283,16 @@ class MayaAscii(object):
             self.data['createNode'][new_chunk_index] = new_chunk
             # if value, 
             if value or lock or keyable:
-                kwKeyword arguments = {}
+                kwargs = {}
                 if value:
-                    kwKeyword arguments['value'] = value
+                    kwargs['value'] = value
                 if attrType and attrType not in simple_attr_types:
-                    kwKeyword arguments['attrType'] = attrType
+                    kwargs['attrType'] = attrType
                 if lock:
-                    kwKeyword arguments['lock'] = lock
+                    kwargs['lock'] = lock
                 if keyable:
-                    kwKeyword arguments['keyable'] = keyable
-                self.setAttr(obj, shortName, **kwKeyword arguments)
+                    kwargs['keyable'] = keyable
+                self.setAttr(obj, shortName, **kwargs)
             return True
         else:
             return False
