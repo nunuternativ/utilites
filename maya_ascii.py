@@ -1,15 +1,26 @@
 import os
 import collections
 import re
+import time
 from collections import defaultdict
 from ast import literal_eval
+from timeit import repeat
+from functools import cache
+
+def invalidate_cache(func):
+    def wrapper(*arg, **kwArgs):
+        res = func(*arg, **kwArgs)
+        if res:
+            MayaAscii.ls.cache_clear()
+        return res
+    return wrapper
 
 class MayaAscii(object):
     ''' Maya's ascii text editor class. Supports operation like open, save, query and some basic modification'''
     def __init__(self, path):
         self.path = path
-        self.data = None
-
+        self._data = None
+        
         self._joiner = '**_JOINER_**'
 
     def read(self):
@@ -22,29 +33,28 @@ class MayaAscii(object):
             line_chunk = []
             curr_cmd = ''
 
-            # get the title and end comment first
+            # get the title comment from the begining of file
             data['title_comment'] = []
-            title_chunks = []
-            i = 0
-            for i, line in enumerate(ascii_lines):
-                if line.startswith('//'):
-                    title_chunks.append(line)
-                else:
-                    break
-            if title_chunks:
-                data['title_comment'].append(title_chunks)
 
-            end_chunks = []
-            e = 0
-            for e, line in enumerate(ascii_lines[::-1]):
+            for line in ascii_lines:
+                if line.startswith('//'):
+                    data['title_comment'].append(line)
+                else:
+                    break            
+
+            # looping from the end of file to get end comment lines
+            end_chunks = []  # need to be a list in case end comment contains multiple lines
+            for line in reversed(ascii_lines):
                 if line.startswith('//'):
                     end_chunks.append(line)
                 else:
                     break
-            if e > 0:
-                lines_to_loop = ascii_lines[i:(e*-1)]
+
+            # get actual lines to loop over
+            if end_chunks:
+                lines_to_loop = ascii_lines[len(data['title_comment']):(len(end_chunks)*-1)]
             else:
-                lines_to_loop = ascii_lines[i:]
+                lines_to_loop = ascii_lines[len(data['title_comment']):]
 
             for line in lines_to_loop:
                 if line == '\n':
@@ -78,9 +88,9 @@ class MayaAscii(object):
                     line_chunk = [line]
                     
             data[curr_cmd].append(line_chunk)  # need to add the last line
-            data['end_comment'] = []
-            if end_chunks:
-                data['end_comment'].append(end_chunks)
+
+            # add end comment
+            data['end_comment'] = [end_chunks] if end_chunks else []
 
         self.data = data
         return data
@@ -91,15 +101,15 @@ class MayaAscii(object):
         Keyword arguments:
             path -- output path to save(str)
         '''
-        result_lines = []
-        for cmd, cmd_chunk in self.data.iteritems():
-            for chunk in cmd_chunk:
-                for line in chunk:
-                    result_lines.append(line)
-
         with open(path, 'w') as f:
-            f.writelines(result_lines)
+            for cmd, cmd_chunk in self.data.iteritems():
+                for chunk in cmd_chunk:
+                    for line in chunk:
+                        f.write(line)
 
+    # FIXME: would be good to cache this result for speed.  
+    # see functools.cache
+    @cache
     def frame_range(self):
         ''' Query the file's minimum, maximum, animation start and animation end frame
 
@@ -122,12 +132,16 @@ class MayaAscii(object):
 
         return result
 
-    def ls(self, search='', types=[], fullPath=True):
+    # FIXME: would be good to cache this result for speed, but you will need
+    #  to invalidate the cache after modifying self.data 
+    # see functools.cache
+    @cache
+    def ls(self, search='', types=tuple(), fullPath=True):
         '''List objects of types in the scene
 
         Keyword arguments:
             search -- regular expression for name search (str)
-            types -- the types of objects to list (list[str])
+            types -- the types of objects to list (tuple[str])
             fullPath -- to return full path to the object or not
 
         Return:
@@ -166,12 +180,15 @@ class MayaAscii(object):
 
         return result
 
-    def delete_node(self, search, types=[]):
+    @invalidate_cache
+    def delete_node(self, search, types=tuple()):
         ''' Remove node from scene
 
         Keyword arguments:
             search -- regular expression for name search (str)
             types -- the types of objects to list (list[str])
+        Return:
+            list[int] -- line no. of deleted lines on success
         '''
         ls_results = self.ls(search=search, types=types)
         if not ls_results:
@@ -182,8 +199,11 @@ class MayaAscii(object):
         for ci, chunk in enumerate(self.data['createNode']):
             if ci not in indices:
                 new_data.append(chunk)
-        self.data['createNode'] = new_data
 
+        self.data['createNode'] = new_data
+        return indices
+
+    @invalidate_cache
     def createNode(self, nodeType, name, parent=None, shared=False):
         ''' Create new node
         
@@ -192,10 +212,11 @@ class MayaAscii(object):
             name -- name of new node (str)
             parent -- name of parent of new node (str)
             shared -- new node being shared node or not (bool)
+        Return:
+            str -- the new lines used for createNode
         '''
-        result = False
         if not self.data:
-            return result
+            return
 
         new_lines = ['createNode %s -n "%s"' %(nodeType, name)]
         if shared:
@@ -208,10 +229,11 @@ class MayaAscii(object):
         new_line += ';\n'
         if 'createNode' not in self.data:
             self.data['createNode'] = []
-        self.data['createNode'].append([new_line])
 
-    def addAttr(self, obj, shortName, attrType, longName='', niceName='', value=None, 
-                dv=None, miv=None, mxv=None, lock=False, keyable=True):
+        self.data['createNode'].append([new_line])
+        return new_line
+
+    def addAttr(self, obj, shortName, attrType, longName='', niceName='', value=None, dv=None, miv=None, mxv=None, lock=False, keyable=True):
         ''' Add attribute to a node in the scene
         
         Keyword arguments:
@@ -283,16 +305,16 @@ class MayaAscii(object):
             self.data['createNode'][new_chunk_index] = new_chunk
             # if value, 
             if value or lock or keyable:
-                kwargs = {}
+                kw_args = {}
                 if value:
-                    kwargs['value'] = value
+                    kw_args['value'] = value
                 if attrType and attrType not in simple_attr_types:
-                    kwargs['attrType'] = attrType
+                    kw_args['attrType'] = attrType
                 if lock:
-                    kwargs['lock'] = lock
+                    kw_args['lock'] = lock
                 if keyable:
-                    kwargs['keyable'] = keyable
-                self.setAttr(obj, shortName, **kwargs)
+                    kw_args['keyable'] = keyable
+                self.setAttr(obj, shortName, **kw_args)
             return True
         else:
             return False
@@ -379,84 +401,90 @@ class MayaAscii(object):
         if not self.data or not self.data.get('createNode'):
             return result
 
-        isSliced = True if re.search('[[0-9]+:.*]', attr) else False 
+        isSliced = bool(re.search('[[0-9]+:.*]', attr))
         for chunk in self.data['createNode']:
             cmd_line = chunk[0]
             name = flag_string_value(line=cmd_line, flag='-n')
-            if name == obj:
-                for line in chunk[1:]:
-                    if line.startswith('\tsetAttr'):
-                        line_splits = line.split(' ')
-                        attr_str = '".%s"' %attr
-                        if attr_str in line:
-                            # get attribute type
-                            attr_type = flag_string_value(line, '-type')
+            if name != obj:
+                continue
 
-                            # it's a simple numeric type
-                            if not attr_type:
-                                value = line_splits[-1]
-                                value = value.replace('\n', '')
-                                value = value.replace('\t', '')
-                                value = value.replace(';', '')
-                                value = value.replace('"', '')
-                                # in case no value to set - setAttr -l on -k off ".tx";
-                                if value != attr_str[1:-1]: 
-                                    value = eval_data_type(value)
-                                    return value
-                            else:
-                                index = line_splits.index('"%s"' %attr_type)
-                                raw_values = line_splits[(index+1):]
-                                values = []
+            for line in chunk[1:]:
+                if not line.startswith('\tsetAttr'):
+                    continue
 
-                                # strip unneccessary strings
-                                for v in raw_values:
-                                    v = v.replace('\n', '')
-                                    v = v.replace('\t', '')
-                                    v = v.replace(';', '')
-                                    v = v.replace('"', '')
-                                    v = v.replace(' ', '')
-                                    if not v:
-                                        continue
-                                    values.append(v)
+                line_splits = line.split(' ')
+                attr_str = '".%s"' %attr
+                if attr_str not in line:
+                    continue
+                    
+                # get attribute type
+                attr_type = flag_string_value(line, '-type')
 
-                                # convert data to python object
-                                converted = []
-                                for v in values:
-                                    vt = eval_data_type(v, attr_type)
-                                    converted.append(vt)
+                # it's a simple numeric type
+                if not attr_type:
+                    value = line_splits[-1]
+                    value = value.replace('\n', '')
+                    value = value.replace('\t', '')
+                    value = value.replace(';', '')
+                    value = value.replace('"', '')
+                    # in case no value to set - setAttr -l on -k off ".tx";
+                    if value != attr_str[1:-1]: 
+                        value = eval_data_type(value)
+                        return value
+                else:
+                    index = line_splits.index('"%s"' %attr_type)
+                    raw_values = line_splits[(index+1):]
+                    values = []
 
-                                # strip the list if it's type string
-                                if attr_type == 'string':
-                                    return ''.join(converted)
-                                # int type
-                                elif attr_type in ('short2', 'long2', 'float2', 'double2'):
-                                    result = []
-                                    pairs = []
-                                    for i, v in enumerate(converted):
-                                        pairs.append(v)
-                                        if i % 2:  # if it's equal number
-                                            result.append(pairs)
-                                            pairs = []
-                                    if not isSliced:
-                                        result = result[0]
-                                    return result
-                                # float types
-                                elif attr_type in ('short3', 'long3', 'float3', 'double3'):
-                                    result = []
-                                    coords = []
-                                    for i, v in enumerate(converted):
-                                        coords.append(v)
-                                        if (i+1)%3 == 0:  
-                                            result.append(coords)
-                                            coords = []
-                                    if not isSliced:
-                                        result = result[0]
-                                    return result
-                                # 4 by 4 matrix type
-                                elif attr_type == 'matrix' and len(converted) == 16:
-                                    return [converted[:3], converted[4:8], converted[8:12], converted[12:]]
+                    # strip unneccessary strings
+                    for v in raw_values:
+                        v = v.replace('\n', '')
+                        v = v.replace('\t', '')
+                        v = v.replace(';', '')
+                        v = v.replace('"', '')
+                        v = v.replace(' ', '')
+                        if not v:
+                            continue
+                        values.append(v)
 
-                                return converted
+                    # convert data to python object
+                    converted = []
+                    for v in values:
+                        vt = eval_data_type(v, attr_type)
+                        converted.append(vt)
+
+                    # strip the list if it's type string
+                    if attr_type == 'string':
+                        return ''.join(converted)
+                    # int type
+                    elif attr_type in ('short2', 'long2', 'float2', 'double2'):
+                        result = []
+                        pairs = []
+                        for i, v in enumerate(converted):
+                            pairs.append(v)
+                            if i % 2:  # if it's equal number
+                                result.append(pairs)
+                                pairs = []
+                        if not isSliced:
+                            result = result[0]
+                        return result
+                    # float types
+                    elif attr_type in ('short3', 'long3', 'float3', 'double3'):
+                        result = []
+                        coords = []
+                        for i, v in enumerate(converted):
+                            coords.append(v)
+                            if (i+1)%3 == 0:  
+                                result.append(coords)
+                                coords = []
+                        if not isSliced:
+                            result = result[0]
+                        return result
+                    # 4 by 4 matrix type
+                    elif attr_type == 'matrix' and len(converted) == 16:
+                        return [converted[:3], converted[4:8], converted[8:12], converted[12:]]
+
+                    return converted
 
     def nodeTypes(self):
         ''' Get a list of node types created in the scene '''
@@ -645,6 +673,7 @@ class MayaAscii(object):
 
         return result
 
+    @invalidate_cache
     def removeNaN(self):
         ''' Remove chunk of data with NaN (not a number) values
         
@@ -737,3 +766,27 @@ maya_scene.delete_node(search=search, types=types)
 maya_scene.write(output_path)
 
 '''
+
+path = "C:/Users/USER/Desktop/kubon_house_v002.ma"
+maya_scene = MayaAscii(path)
+maya_scene.read()
+
+# get frame range
+# maya_scene.frame_range()
+# maya_scene.frame_range()  # the second call took less time
+
+# list an object
+obj = 'facet_F2_08'
+st = time.time()
+maya_scene.ls(search=obj, types=tuple())  # slow
+print(time.time() - st)
+
+st = time.time()
+maya_scene.ls(search=obj, types=tuple())  # fast (cached!)
+print(time.time() - st)
+
+# now delete it
+st = time.time()
+maya_scene.delete_node(search=obj, types=tuple())  # delete node also use ls(), call is faster
+print(time.time() - st)
+
